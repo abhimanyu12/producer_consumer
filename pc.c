@@ -4,34 +4,23 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <time.h>
+#include <getopt.h>
 #include <sys/syscall.h>
+
+#include "private_data.h"
 
 #define DH_CONSUMER	1
 
-int packet_data = 0;
-typedef struct {
-	bool dh_flag;
-	int data;
-} packet_t;
+/*Used instead of rand() to allow easy debugging of data packets
+ * and track production and consumption to ensure
+ * zero packet loss
+ */
+unsigned int packet_data = 0;
 
-typedef struct {
-	packet_t* buf;
-	size_t len;
-	size_t capacity;
-	int producer_index;
-	int consumer_index;
-	pthread_mutex_t mutex;
-	pthread_cond_t empty;
-	pthread_cond_t full;
-} buffer_t;
-
-typedef struct {
-	int id;
-	int max_packet;
-	buffer_t *bptr;
-} thread_info;
-
-bool dh_flag_in_use = false;
+/* Only static global variable used to
+ * define state of the DH flag
+ */
+static int dh_flag_in_use = 0;
 
 void __core_consume(buffer_t *buffer, int id)
 {
@@ -155,52 +144,109 @@ void* consumer(void *arg) {
 	return NULL;
 }
 
+void print_usage(void)
+{
+	printf("Usage: ./pc \n\t-p <Num of producer threads>\n\t–c <Num of comsumer threads>\n\t--pn <Max packets produced per second>\n\t--pc <Max packets consumed per second>\n\t-q <Max size of shared buffer>\n\t-dh <Optional: Enable DH flag for consumer 1>\nExample Usage\n./pc -p 1 -c 2 --pn 20 --pc 5 -q 40 -dh\n");
+}
+
 int main(int argc, char *argv[]) {
 
-	int i, num_prod, num_cons;
-	int max_packet_per_sec_prod = 10;
-	int max_packet_per_sec_cons = 5;
+	int i;
+	int num_prod = 0;
+	int num_cons = 0;
+	int max_packet_per_sec_prod = 0;
+	int max_packet_per_sec_cons = 0;
 	int ret = 0;
-	num_prod = 2;
-	num_cons = 4;
+	int opt;
+	size_t max_buf_size = 5;
+	extern char * optarg;
+	int long_index = 0;
+
 	pthread_t *prod_threads = NULL;
 	pthread_t *cons_threads = NULL;
 	thread_info *cons_info = NULL;
 	thread_info *prod_info = NULL;
 
+	static struct option long_options[] = {
+		{"dh",          no_argument, &dh_flag_in_use,  1 },
+		{"producer",	required_argument, 0,  'p' },
+		{"consumer",	required_argument, 0,  'c' },
+		{"pn",		required_argument, 0,  'x' },
+		{"pc",		required_argument, 0,  'y' },
+		{"que",		required_argument, 0,  'q' },
+		{0,           0,                 0,  0   }
+	};
+
+	while ((opt = getopt_long(argc, argv,"p:c:x:y:q:d::",
+				  long_options, &long_index )) != -1) {
+		if (opt == -1)
+			break;
+		switch(opt) {
+			case 'p': num_prod = atoi(optarg);
+				  break;
+			case 'c': num_cons = atoi(optarg);
+				  break;
+			case 'x': max_packet_per_sec_prod = atoi(optarg);
+				  break;
+			case 'y': max_packet_per_sec_cons = atoi(optarg);
+				  break;
+			case 'q': max_buf_size = atoi(optarg);
+				  break;
+			case 'd': dh_flag_in_use = true;
+				  break;
+			default: print_usage();
+				 return -1;
+		}
+	}
+
+	/* Do not accept input if any of the folowing are NULL
+	 * Number of proucers
+	 * Number of consumers
+	 * Max size of shared Buffer
+	 * Packet per second production/consumption
+	 */
+	if (!num_prod || !num_cons || !max_packet_per_sec_prod ||
+	     !max_packet_per_sec_cons || !max_buf_size) {
+		print_usage();
+		return -1;
+	}
+
+	/* Static buffer */
 	buffer_t buffer = {
         .len = 0,
 	.producer_index = 0,
 	.consumer_index = 0,
-	.capacity = 40,
+	.capacity = max_buf_size,
         .mutex = PTHREAD_MUTEX_INITIALIZER,
         .empty = PTHREAD_COND_INITIALIZER,
         .full = PTHREAD_COND_INITIALIZER
 	};
 
-	dh_flag_in_use = true;
-
-	buffer.buf = malloc(buffer.capacity*sizeof(packet_t));
+	/* Dynamic buffer array allocation */
+	buffer.buf = malloc(buffer.capacity * sizeof(packet_t));
 	if (!buffer.buf) {
 		printf("Unable to procure memory\n");
 		ret = -1;
 		goto exit;
 	}
 
-	prod_threads = malloc(num_prod*sizeof(pthread_t));
+	/* Producer thread allocation */
+	prod_threads = malloc(num_prod * sizeof(pthread_t));
 	if (!prod_threads) {
 		printf("Unable to procure memory\n");
 		ret = -1;
 		goto free_buf;
 	}
 
-	cons_threads = malloc(num_cons*sizeof(pthread_t));
+	/* Consumer thread allocation */
+	cons_threads = malloc(num_cons * sizeof(pthread_t));
 	if (!cons_threads) {
 		printf("Unable to procure memory\n");
 		ret = -1;
 		goto free_prod;
 	}
 
+	/* Producer thread info allocations */
 	prod_info = malloc(num_prod * sizeof(thread_info));
 	if (!prod_info) {
 		printf("Unable to procure memory\n");
@@ -208,6 +254,7 @@ int main(int argc, char *argv[]) {
 		goto free_cons;
 	}
 
+	/* Consumer thread info allocation */
 	cons_info = malloc(num_cons * sizeof(thread_info));
 	if (!cons_info) {
 		printf("Unable to procure memory\n");
@@ -220,6 +267,7 @@ int main(int argc, char *argv[]) {
 	 */
 	srand(0);
 
+	/* Init and start producers and consumers */
 	for (i = 0; i < num_prod; i++) {
 		prod_info[i].bptr = &buffer;
 		prod_info[i].id = i+1;
@@ -250,6 +298,10 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	/* Wait for threads to exit and join back
+	 * In regular operation run the execution
+	 * should never reach here.
+	 */
 	for (i = 0; i < num_prod; i++)
 		pthread_join(prod_threads[i], NULL);
 	for (i = 0; i < num_cons; i++)
